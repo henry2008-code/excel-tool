@@ -1333,7 +1333,7 @@ class MainWindow(QMainWindow):
         self.city_input.clear()
         self.pwd_input.clear()
         self._refresh_pwd_tags()
-        self._update_file_passwords_for_city()
+        self._auto_match_all_files()
         self.statusBar().showMessage(f"已添加: {city}")
 
     def _remove_city_password(self, city):
@@ -1341,7 +1341,7 @@ class MainWindow(QMainWindow):
         if city in self.city_passwords:
             del self.city_passwords[city]
             self._refresh_pwd_tags()
-            self._update_file_passwords_for_city()
+            self._auto_match_all_files()
 
     def _refresh_pwd_tags(self):
         """刷新城市密码标签"""
@@ -1370,8 +1370,8 @@ class MainWindow(QMainWindow):
             self.pwd_tags_layout.addWidget(tag_btn)
         self.pwd_tags_layout.addStretch()
 
-    def _update_file_passwords_for_city(self):
-        """根据城市密码映射，自动更新文件列表中对应城市的密码"""
+    def _auto_match_all_files(self):
+        """重新扫描所有文件，根据城市密码自动匹配密码"""
         self.file_table.itemChanged.disconnect(self._on_file_table_item_changed)
         try:
             for row in range(self.file_table.rowCount()):
@@ -1379,13 +1379,28 @@ class MainWindow(QMainWindow):
                 pwd_item = self.file_table.item(row, 2)
                 if not city_item or not pwd_item:
                     continue
+                
                 city = city_item.text().strip()
+                
+                # 如果城市为空，尝试从文件名重新识别
+                if not city and row < len(self.file_list):
+                    filepath = self.file_list[row][0]
+                    city = self._guess_city_from_filename(filepath)
+                    city_item.setText(city)
+                
+                # 根据城市自动填充密码
                 if city and city in self.city_passwords:
                     new_pwd = self.city_passwords[city]
                     if pwd_item.text() != new_pwd:
                         pwd_item.setText(new_pwd)
                         if row < len(self.file_list):
                             self.file_list[row] = (self.file_list[row][0], city, new_pwd, self.file_list[row][3])
+                elif city:
+                    # 城市不在密码列表中，清空密码
+                    if pwd_item.text():
+                        pwd_item.setText("")
+                        if row < len(self.file_list):
+                            self.file_list[row] = (self.file_list[row][0], city, "", self.file_list[row][3])
         finally:
             self.file_table.itemChanged.connect(self._on_file_table_item_changed)
 
