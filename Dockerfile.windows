@@ -1,0 +1,48 @@
+# 用于在 macOS 上交叉编译 Windows EXE 的 Docker 镜像
+# 基于 Wine + PyInstaller
+
+FROM python:3.12-slim
+
+# 设置环境变量
+ENV DEBIAN_FRONTEND=noninteractive
+ENV WINEARCH=win64
+ENV WINEPREFIX=/root/.wine
+
+# 安装 Wine 和依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wine64 \
+    wine64-tools \
+    wine64-preloader \
+    fonts-wine \
+    && rm -rf /var/lib/apt/lists/*
+
+# 初始化 Wine
+RUN winecfg || true
+
+# 安装 Python for Windows（通过 Wine）
+# 这里使用预先编译的 Windows Python 嵌入式版本
+ENV PYTHON_WIN_URL="https://www.python.org/ftp/python/3.12.0/python-3.12.0-embed-amd64.zip"
+ENV PYTHON_WIN_DIR="C:\\\\Python312"
+
+RUN mkdir -p /tmp/python-win && \
+    cd /tmp/python-win && \
+    wget -q "${PYTHON_WIN_URL}" -O python-embed.zip && \
+    unzip python-embed.zip -d /opt/python-win && \
+    rm python-embed.zip && \
+    cd /opt/python-win && \
+    # 取消注释 import site 以支持 pip
+    sed -i 's/^#import site/import site/' python312._pth && \
+    # 下载 get-pip.py
+    wget -q "https://bootstrap.pypa.io/get-pip.py" && \
+    # 通过 Wine 运行 Python 安装 pip
+    echo "安装 Windows Python 和 pip..." && \
+    true
+
+# 安装 PyInstaller for Windows
+RUN pip install pyinstaller
+
+# 设置工作目录
+WORKDIR /app
+
+# 默认命令
+CMD ["bash"]

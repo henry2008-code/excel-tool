@@ -1,0 +1,5 @@
+PyQt6>=6.4.0
+openpyxl>=3.0.0
+olefile>=0.46
+cryptography>=3.4.0
+msoffcrypto-tool>=5.0.0
