@@ -1972,10 +1972,10 @@ class MainWindow(QMainWindow):
             logger.error(f"保存配置失败: {str(e)}")
     
     def _import_passwords_batch(self):
-        """批量导入城市密码（从 CSV 或 JSON 文件）"""
+        """批量导入城市密码（从 Excel、CSV 或 JSON 文件）"""
         filepath, _ = QFileDialog.getOpenFileName(
             self, "导入城市密码", "",
-            "CSV/JSON文件 (*.csv *.json);;所有文件 (*)"
+            "Excel/CSV/JSON文件 (*.xlsx *.xls *.csv *.json);;所有文件 (*)"
         )
         
         if not filepath:
@@ -2015,6 +2015,22 @@ class MainWindow(QMainWindow):
                             if city:
                                 self.city_passwords[city] = password
                                 imported_count += 1
+            
+            elif filepath.endswith(('.xlsx', '.xls')):
+                # Excel 格式: 第一列城市名称，第二列密码
+                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+                ws = wb.active
+                
+                # 跳过表头（如果有的话），从第二行开始读取
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if len(row) >= 2:
+                        city = str(row[0]).strip() if row[0] is not None else ''
+                        password = str(row[1]).strip() if row[1] is not None else ''
+                        if city:
+                            self.city_passwords[city] = password
+                            imported_count += 1
+                
+                wb.close()
             
             self._refresh_pwd_tags()
             self._auto_match_all_files()
