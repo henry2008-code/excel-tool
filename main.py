@@ -56,7 +56,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QFileDialog,
     QProgressBar, QTextEdit, QGroupBox, QHeaderView, QComboBox,
     QStyledItemDelegate, QAbstractItemView, QMessageBox, QLineEdit,
-    QSpinBox, QCheckBox
+    QSpinBox, QCheckBox, QInputDialog, QFrame
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QColor, QFont, QDragEnterEvent, QDropEvent
@@ -790,6 +790,42 @@ def _read_header_row(filepath, header_rows, read_only=True, sheet_name=None):
     return header_row
 
 
+def _read_all_header_rows(filepath, header_row_count, sheet_name=None):
+    """
+    读取所有表头行（1到header_row_count），正确处理合并单元格。
+    对于合并单元格区域，将左上角的值填充到区域内所有单元格。
+    返回列表的列表: [[row1_vals], [row2_vals], ..., [rowN_vals]]
+    """
+    wb = openpyxl.load_workbook(filepath, read_only=False, data_only=True)
+    if sheet_name and sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+    else:
+        ws = wb[wb.sheetnames[0]]
+    
+    # 构建合并单元格映射：(row, col) -> merged_value
+    merged_values = {}
+    for merged_range in ws.merged_cells.ranges:
+        top_left_cell = ws.cell(row=merged_range.min_row, column=merged_range.min_col)
+        value = top_left_cell.value
+        if value is not None:
+            for row in range(merged_range.min_row, merged_range.max_row + 1):
+                for col in range(merged_range.min_col, merged_range.max_col + 1):
+                    merged_values[(row, col)] = value
+    
+    all_rows = []
+    for row_num in range(1, header_row_count + 1):
+        row_data = []
+        for cell in ws[row_num]:
+            if (cell.row, cell.column) in merged_values:
+                row_data.append(merged_values[(cell.row, cell.column)])
+            else:
+                row_data.append(cell.value if cell.value is not None else '')
+        all_rows.append(row_data)
+    
+    wb.close()
+    return all_rows
+
+
 def _build_unified_columns(all_headers):
     """
     根据所有文件的表头行构建统一列列表和映射。
@@ -812,28 +848,56 @@ def _build_unified_columns(all_headers):
         first_mapping[src_idx] = src_idx
     column_mappings.append(first_mapping)
 
+    # 记录 unified 中已有的空列位置（用于后续文件按位置匹配空列）
+    unified_empty_positions = set()
+    for i, name in enumerate(unified):
+        n = str(name).strip() if name else ''
+        if not n:
+            unified_empty_positions.add(i)
+
     # 处理后续文件
     for file_idx in range(1, len(all_headers)):
         header = all_headers[file_idx]
         mapping = {}
         
+        # 统计 unified 中每个列名的所有位置（用于处理重复列名）
+        unified_name_positions = {}
+        for i, name in enumerate(unified):
+            n = str(name).strip() if name else ''
+            unified_name_positions.setdefault(n, []).append(i)
+        
+        # 跟踪当前文件中每个列名已匹配的次数
+        name_occurrence = {}
+        
         for src_idx, col_name in enumerate(header):
             col_name = str(col_name).strip() if col_name else ''
             
             if not col_name:
-                # 空列名：创建新的独立列（每个空列都独立）
-                dst_idx = len(unified)
-                unified.append('')
-                mapping[src_idx] = dst_idx
-            elif col_name in unified:
-                # 列名已存在，映射到该位置（相同列名合并）
-                dst_idx = unified.index(col_name)
-                mapping[src_idx] = dst_idx
+                # 空列名：优先按位置匹配 unified 中已有的空列
+                if src_idx in unified_empty_positions:
+                    # unified 在相同位置已有空列，直接复用
+                    mapping[src_idx] = src_idx
+                else:
+                    # 该位置没有空列，创建新的独立列
+                    dst_idx = len(unified)
+                    unified.append('')
+                    unified_empty_positions.add(dst_idx)
+                    mapping[src_idx] = dst_idx
             else:
-                # 新列名，追加到末尾
-                dst_idx = len(unified)
-                unified.append(col_name)
-                mapping[src_idx] = dst_idx
+                # 记录当前列名在源文件中是第几次出现
+                occurrence = name_occurrence.get(col_name, 0)
+                name_occurrence[col_name] = occurrence + 1
+                
+                positions = unified_name_positions.get(col_name, [])
+                if occurrence < len(positions):
+                    # 匹配到 unified 中对应位置的第 N 次出现
+                    mapping[src_idx] = positions[occurrence]
+                else:
+                    # 该列名的第 N+1 次出现，unified 中还没有，追加到末尾
+                    dst_idx = len(unified)
+                    unified.append(col_name)
+                    mapping[src_idx] = dst_idx
+                    unified_name_positions.setdefault(col_name, []).append(dst_idx)
         
         column_mappings.append(mapping)
 
@@ -899,6 +963,104 @@ def _expand_merged_ranges(merged_ranges_info, original_col_count, new_col_count)
             expanded.append(mc_str)
     
     return expanded
+
+
+def _supplement_title_row_merges(merged_ranges_info, header_rows_data, total_cols, all_files_max_col=None):
+    """
+    为表头中的标题行（如"月工资报表"）补充全宽合并单元格。
+    
+    检测逻辑：如果某行只有少量非空值且集中在开头（标题行特征），
+    且该行没有被水平合并单元格覆盖，则自动添加跨全列的合并。
+    
+    Args:
+        merged_ranges_info: 已有的合并单元格范围列表 (如 "A1:KJ1")
+        header_rows_data: 表头行数据列表 [[row1_vals], [row2_vals], ...]
+        total_cols: 总列数
+        all_files_max_col: {row_idx: max_non_empty_col_idx} 所有文件中每行的最大非空列索引
+                          如果某行在后面的文件中有内容，则不应添加全宽合并
+        
+    Returns:
+        补充后的合并单元格范围列表
+    """
+    if not header_rows_data or total_cols <= 1:
+        return merged_ranges_info
+
+    import re as _re
+
+    # 解析已有的合并范围，找出哪些行有水平合并及其范围
+    rows_with_horizontal_merge = set()
+    # 同时记录每行已有水平合并的最大结束列(0-based)
+    row_hmerge_max_end_col = {}
+    for mc_str in merged_ranges_info:
+        parts = mc_str.split(':')
+        if len(parts) == 2:
+            start_col = ''.join(c for c in parts[0] if c.isalpha())
+            end_col = ''.join(c for c in parts[1] if c.isalpha())
+            if start_col != end_col:
+                start_row = int(''.join(c for c in parts[0] if c.isdigit()))
+                end_row = int(''.join(c for c in parts[1] if c.isdigit()))
+                # 计算结束列索引(0-based)
+                end_col_idx = 0
+                for c in end_col:
+                    end_col_idx = end_col_idx * 26 + (ord(c) - 64)
+                end_col_idx -= 1  # 转为0-based
+                for r in range(start_row, end_row + 1):
+                    rows_with_horizontal_merge.add(r)
+                    if r not in row_hmerge_max_end_col or end_col_idx > row_hmerge_max_end_col[r]:
+                        row_hmerge_max_end_col[r] = end_col_idx
+
+    supplemented = list(merged_ranges_info)
+    last_col_letter = _col_letter(total_cols - 1)
+
+    total_header_rows = len(header_rows_data)
+    for row_idx, row_data in enumerate(header_rows_data):
+        row_num = row_idx + 1
+
+        # 跳过最后一行表头（列名行，不应该被合并）
+        if row_num == total_header_rows:
+            continue
+
+        # 如果该行已经有水平合并，跳过
+        if row_num in rows_with_horizontal_merge:
+            continue
+
+        # 找出非空值的位置
+        non_empty_indices = [i for i, v in enumerate(row_data) if v is not None and str(v).strip() != '']
+        if not non_empty_indices:
+            continue
+
+        # 检查所有文件中该行是否有内容超出标题区域
+        # 如果其他文件在该行后面列有内容，则不应添加全宽合并
+        if all_files_max_col and row_idx in all_files_max_col:
+            global_max_col = all_files_max_col[row_idx]
+            # 如果该行在某个文件中有内容超出前5列，说明不是纯标题行
+            if global_max_col > 4:
+                continue
+
+        # 检查是否只有少量非空值且集中在开头（标题行特征）
+        max_non_empty = non_empty_indices[-1]
+        min_non_empty = non_empty_indices[0]
+        non_empty_count = len(non_empty_indices)
+
+        # 标题行判断规则：
+        # 1. 非空值集中在前5列且个数 <= 5（标准标题行）
+        # 2. 非空值个数很少（<= 3），即使分散也可能是标题+备注
+        # 3. 第一个非空值在前3列，且非空值密度很低（< 5% 的列有值）
+        is_title_row = False
+        if min_non_empty <= 2:
+            if max_non_empty <= 4 and non_empty_count <= 5:
+                is_title_row = True
+            elif non_empty_count <= 3:
+                is_title_row = True
+            elif non_empty_count / total_cols < 0.05:
+                is_title_row = True
+
+        if is_title_row:
+            mc_ref = f"A{row_num}:{last_col_letter}{row_num}"
+            supplemented.append(mc_ref)
+            logger.info(f"为标题行 Row{row_num} 添加全宽合并: {mc_ref} (值: {row_data[non_empty_indices[0]]})")
+
+    return supplemented
 
 
 def _inject_merge_cells_to_xlsx(xlsx_path, merged_ranges):
@@ -1012,12 +1174,14 @@ class MergeConfig:
     log_file: Optional[str] = None  # 日志文件路径
 
 
-def _decrypt_single_file(file_info: Tuple[str, str, str, str], progress_callback=None, idx: int = 0, total: int = 1) -> Tuple[Optional[str], str, str]:
+def _decrypt_single_file(file_info: Tuple[str, str, str, str], progress_callback=None, idx: int = 0, total: int = 1) -> Tuple[Optional[str], str, str, bool]:
     """
     解密单个文件（用于并行处理）
     
     Returns:
-        (temp_path或None, city, target_sheet)
+        (filepath, city, target_sheet, is_temp_file)
+        filepath: 解密后的文件路径或原始路径
+        is_temp_file: 是否为临时文件（需要清理）
     """
     filepath, city, password, target_sheet = file_info
     
@@ -1028,15 +1192,15 @@ def _decrypt_single_file(file_info: Tuple[str, str, str, str], progress_callback
     if is_encrypted_file(filepath):
         if not password:
             logger.warning(f"跳过 {os.path.basename(filepath)}: 文件已加密但未提供密码")
-            return (None, city, target_sheet)
+            return (None, city, target_sheet, False)
         try:
             temp_path = decrypt_to_tempfile(filepath, password)
-            return (temp_path, city, target_sheet)
+            return (temp_path, city, target_sheet, True)
         except DecryptionError as e:
             logger.error(f"解密失败 {os.path.basename(filepath)}: {str(e)}")
-            return (None, city, target_sheet)
+            return (None, city, target_sheet, False)
     else:
-        return (filepath, city, target_sheet)
+        return (filepath, city, target_sheet, False)
 
 
 def merge_excel_files_with_decrypt(
@@ -1103,14 +1267,15 @@ def merge_excel_files_with_decrypt(
                     try:
                         result = future.result()
                         decrypted_files.append((idx, result))
-                        if result[0]:  # temp_path
-                            temp_files.append(result[0])
+                        if result[0]:
+                            if result[3]:  # is_temp_file
+                                temp_files.append(result[0])
                             stats['success_files'] += 1
                         else:
                             stats['failed_files'] += 1
                     except Exception as e:
                         logger.error(f"解密任务异常: {str(e)}")
-                        decrypted_files.append((idx, (None, file_infos[idx][1], file_infos[idx][3])))
+                        decrypted_files.append((idx, (None, file_infos[idx][1], file_infos[idx][3], False)))
                         stats['failed_files'] += 1
         else:
             # 单文件或小文件串行处理
@@ -1118,7 +1283,8 @@ def merge_excel_files_with_decrypt(
                 result = _decrypt_single_file(fi, progress_callback, idx, total)
                 decrypted_files.append((idx, result))
                 if result[0]:
-                    temp_files.append(result[0])
+                    if result[3]:  # is_temp_file
+                        temp_files.append(result[0])
                     stats['success_files'] += 1
                 else:
                     stats['failed_files'] += 1
@@ -1129,146 +1295,285 @@ def merge_excel_files_with_decrypt(
         
         logger.info(f"解密完成: 成功 {stats['success_files']}, 失败 {stats['failed_files']}")
 
-        # 第二步：预扫描 - 读取合并单元格信息 + 列名信息
-        detected_header_rows = header_rows
-        merged_ranges_info = []
+        # 收集需要处理的 sheet 名称列表
+        has_target_sheet = any(fi[3] for fi in file_infos)
+        if has_target_sheet:
+            # 指定了 sheet 名，只处理该 sheet
+            sheet_names_to_process = list(dict.fromkeys(
+                fi[3] for fi in file_infos if fi[3]
+            ))
+        else:
+            # 未指定 sheet，收集所有文件的所有 sheet 名
+            all_sheet_names = []
+            for filepath_dt, city_dt, target_sheet_dt, _is_temp_dt in decrypted_files:
+                if filepath_dt is None:
+                    continue
+                try:
+                    wb_tmp = openpyxl.load_workbook(filepath_dt, read_only=True)
+                    for sn in wb_tmp.sheetnames:
+                        if sn not in all_sheet_names:
+                            all_sheet_names.append(sn)
+                    wb_tmp.close()
+                except Exception:
+                    pass
+            sheet_names_to_process = all_sheet_names
+            logger.info(f"未指定 sheet，将按 sheet 合并: {sheet_names_to_process}")
 
-        # 2a. 读取第一个文件的合并单元格信息
-        for idx_pre, (filepath_pre, city_pre, target_sheet_pre) in enumerate(decrypted_files):
-            if filepath_pre is None:
-                continue
-            try:
-                if target_sheet_pre:
-                    merged_ranges_info, auto_header_rows = _read_merged_cells_lightweight(
-                        filepath_pre, sheet_name=target_sheet_pre
-                    )
-                else:
-                    merged_ranges_info, auto_header_rows = _read_merged_cells_lightweight(filepath_pre)
-                if header_rows <= 0:
-                    if merged_ranges_info:
-                        detected_header_rows = auto_header_rows
-                    if detected_header_rows <= 0:
-                        detected_header_rows = 1
-                if progress_callback:
-                    progress_callback(0, total * 2,
-                                      f"检测到表头 {detected_header_rows} 行, "
-                                      f"合并单元格 {len(merged_ranges_info)} 个")
-                break
-            except Exception as e:
-                if progress_callback:
-                    progress_callback(0, total * 2,
-                                      f"读取合并单元格信息失败: {str(e)}")
-                detected_header_rows = max(detected_header_rows, 1)
-                continue
+        if not sheet_names_to_process:
+            sheet_names_to_process = [None]  # 回退到默认行为
 
-        if detected_header_rows <= 0:
-            detected_header_rows = 1
-
-        # 2b. 读取所有文件的列名行，构建统一列映射
-        all_headers = []
-        valid_file_indices = []  # 记录有效文件的索引
-        for idx, (filepath, city, target_sheet) in enumerate(decrypted_files):
-            if filepath is None:
-                all_headers.append([])
-                continue
-            try:
-                header = _read_header_row(filepath, detected_header_rows, sheet_name=target_sheet)
-                all_headers.append(header)
-                valid_file_indices.append(idx)
-            except Exception:
-                all_headers.append([])
-
-        unified_columns, column_mappings = _build_unified_columns(all_headers)
-        total_cols = len(unified_columns)
-        first_file_col_count = len(all_headers[0]) if all_headers and all_headers[0] else total_cols
-        
-        # 打印调试信息
-        logger.info(f"统一列: {unified_columns}")
-        logger.info(f"总列数: {total_cols}, 第一个文件列数: {first_file_col_count}")
-        for idx, mapping in enumerate(column_mappings):
-            logger.info(f"文件{idx} 列映射: {mapping}")
-
-        # 2c. 扩展合并单元格范围（如果新增了列）
-        if total_cols > first_file_col_count and merged_ranges_info:
-            merged_ranges_info = _expand_merged_ranges(
-                merged_ranges_info, first_file_col_count, total_cols
-            )
-
-        if progress_callback:
-            extra_cols = total_cols - first_file_col_count
-            progress_callback(0, total * 2,
-                              f"统一列数: {total_cols}, 额外列: {extra_cols}, "
-                              f"表头 {detected_header_rows} 行")
-
-        # 第三步：合并数据到一个工作表
+        # 创建输出工作簿（write_only 模式，支持多 sheet）
         output_wb = openpyxl.Workbook(write_only=True)
-        out_ws = output_wb.create_sheet(title=config.output_sheet_name)
 
-        first_file = True
+        all_sheet_merged_ranges = {}  # {sheet_name: [merged_ranges]}
         total_data_rows = 0
-        seen_rows = set()  # 用于去重
+        total_cols_max = 0
         skipped_empty = 0
 
-        for idx, (filepath, city, target_sheet) in enumerate(decrypted_files):
-            if filepath is None:
-                continue
+        # ============================================================
+        # 对每个 sheet 分别执行扫描和合并
+        # ============================================================
+        for _sheet_name in sheet_names_to_process:
+            out_sheet_name = _sheet_name if _sheet_name else config.output_sheet_name
+
+            # 第二步：预扫描 - 读取合并单元格信息 + 列名信息
+            detected_header_rows = header_rows
+            merged_ranges_info = []
+
+            # 2a. 读取第一个文件的合并单元格信息（针对当前 sheet）
+            for idx_pre, (filepath_pre, city_pre, target_sheet_pre, _is_temp) in enumerate(decrypted_files):
+                if filepath_pre is None:
+                    continue
+                if target_sheet_pre and target_sheet_pre != _sheet_name:
+                    continue
+                if not target_sheet_pre and _sheet_name:
+                    try:
+                        wb_check = openpyxl.load_workbook(filepath_pre, read_only=True)
+                        has_sheet = _sheet_name in wb_check.sheetnames
+                        wb_check.close()
+                        if not has_sheet:
+                            continue
+                    except Exception:
+                        continue
+                try:
+                    merged_ranges_info, auto_header_rows = _read_merged_cells_lightweight(
+                        filepath_pre, sheet_name=_sheet_name
+                    )
+                    if header_rows <= 0:
+                        if merged_ranges_info:
+                            detected_header_rows = auto_header_rows
+                        if detected_header_rows <= 0:
+                            detected_header_rows = 1
+                    if progress_callback:
+                        progress_callback(0, total * 2,
+                                          f"[{out_sheet_name}] 检测到表头 {detected_header_rows} 行, "
+                                          f"合并单元格 {len(merged_ranges_info)} 个")
+                    break
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback(0, total * 2,
+                                          f"[{out_sheet_name}] 读取合并单元格信息失败: {str(e)}")
+                    detected_header_rows = max(detected_header_rows, 1)
+                    continue
+
+            if detected_header_rows <= 0:
+                detected_header_rows = 1
+
+            # 2b. 读取所有文件的列名行，构建统一列映射（针对当前 sheet）
+            all_headers = []
+            valid_file_indices = []
+            for idx, (filepath, city, target_sheet, _is_temp) in enumerate(decrypted_files):
+                if filepath is None:
+                    all_headers.append([])
+                    continue
+                if target_sheet and target_sheet != _sheet_name:
+                    all_headers.append([])
+                    continue
+                if not target_sheet and _sheet_name:
+                    try:
+                        wb_check2 = openpyxl.load_workbook(filepath, read_only=True)
+                        has_sheet2 = _sheet_name in wb_check2.sheetnames
+                        wb_check2.close()
+                        if not has_sheet2:
+                            all_headers.append([])
+                            continue
+                    except Exception:
+                        all_headers.append([])
+                        continue
+                try:
+                    header = _read_header_row(filepath, detected_header_rows, sheet_name=_sheet_name)
+                    all_headers.append(header)
+                    valid_file_indices.append(idx)
+                except Exception:
+                    all_headers.append([])
+
+            unified_columns, column_mappings = _build_unified_columns(all_headers)
+            total_cols = len(unified_columns)
+            first_file_col_count = 0
+            for h in all_headers:
+                if h:
+                    first_file_col_count = len(h)
+                    break
+            if first_file_col_count == 0:
+                first_file_col_count = total_cols
+
+            logger.info(f"[{out_sheet_name}] 统一列: {unified_columns}")
+            logger.info(f"[{out_sheet_name}] 总列数: {total_cols}, 第一个文件列数: {first_file_col_count}")
+            for idx, mapping in enumerate(column_mappings):
+                logger.info(f"[{out_sheet_name}] 文件{idx} 列映射: {mapping}")
+
+            # 2d. 预读取第一个文件的所有表头行（含合并单元格值填充）
+            first_file_header_rows_data = []
+            if merged_ranges_info and detected_header_rows > 0:
+                first_file_info = None
+                for fi in decrypted_files:
+                    if fi[0] is not None:
+                        if fi[2] and fi[2] != _sheet_name:
+                            continue
+                        if not fi[2] and _sheet_name:
+                            try:
+                                wb_c = openpyxl.load_workbook(fi[0], read_only=True)
+                                has_s = _sheet_name in wb_c.sheetnames
+                                wb_c.close()
+                                if not has_s:
+                                    continue
+                            except Exception:
+                                continue
+                        first_file_info = fi
+                        break
+                if first_file_info:
+                    try:
+                        first_file_header_rows_data = _read_all_header_rows(
+                            first_file_info[0], detected_header_rows,
+                            sheet_name=_sheet_name
+                        )
+                        logger.info(f"[{out_sheet_name}] 预读取第一个文件 {detected_header_rows} 行表头")
+                    except Exception as e:
+                        logger.warning(f"[{out_sheet_name}] 预读取表头失败: {e}，将在合并循环中回退读取")
+
+            # 2e. 读取所有文件的表头行数据，构建每行最大非空列索引映射
+            all_files_max_col = {}  # {row_idx: max_non_empty_col_idx_across_all_files}
+            if merged_ranges_info and detected_header_rows > 0:
+                for fi in decrypted_files:
+                    if fi[0] is None:
+                        continue
+                    if fi[2] and fi[2] != _sheet_name:
+                        continue
+                    if not fi[2] and _sheet_name:
+                        try:
+                            wb_c = openpyxl.load_workbook(fi[0], read_only=True)
+                            has_s = _sheet_name in wb_c.sheetnames
+                            wb_c.close()
+                            if not has_s:
+                                continue
+                        except Exception:
+                            continue
+                    try:
+                        fi_headers = _read_all_header_rows(
+                            fi[0], detected_header_rows, sheet_name=_sheet_name
+                        )
+                        for ri, hrow in enumerate(fi_headers):
+                            for ci in range(len(hrow) - 1, -1, -1):
+                                v = hrow[ci]
+                                if v is not None and str(v).strip() != '':
+                                    if ri not in all_files_max_col or ci > all_files_max_col[ri]:
+                                        all_files_max_col[ri] = ci
+                                    break
+                    except Exception:
+                        pass
+
+            # 2f. 为标题行补充全宽合并单元格（考虑所有文件的内容）
+            if first_file_header_rows_data and merged_ranges_info:
+                merged_ranges_info = _supplement_title_row_merges(
+                    merged_ranges_info, first_file_header_rows_data, total_cols,
+                    all_files_max_col=all_files_max_col
+                )
+
+            # 2c. 扩展合并单元格范围（如果新增了列）
+            if total_cols > first_file_col_count and merged_ranges_info:
+                merged_ranges_info = _expand_merged_ranges(
+                    merged_ranges_info, first_file_col_count, total_cols
+                )
 
             if progress_callback:
-                progress_callback(total + idx, total * 2,
-                                  f"正在合并: {os.path.basename(filepath)}")
+                extra_cols = total_cols - first_file_col_count
+                progress_callback(0, total * 2,
+                                  f"[{out_sheet_name}] 统一列数: {total_cols}, 额外列: {extra_cols}, "
+                                  f"表头 {detected_header_rows} 行")
 
-            try:
-                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-                mapping = column_mappings[idx] if idx < len(column_mappings) else {}
+            # 第三步：合并当前 sheet 的数据
+            out_ws = output_wb.create_sheet(title=out_sheet_name)
+            first_file = True
+            seen_rows = set()
+            sheet_data_rows = 0
 
-                # 确定要读取的 sheet
-                if target_sheet and target_sheet in wb.sheetnames:
-                    sheets_to_read = [target_sheet]
-                else:
-                    sheets_to_read = wb.sheetnames
+            for idx, (filepath, city, target_sheet, _is_temp) in enumerate(decrypted_files):
+                if filepath is None:
+                    continue
+                if target_sheet and target_sheet != _sheet_name:
+                    continue
+                if not target_sheet and _sheet_name:
+                    try:
+                        wb_c2 = openpyxl.load_workbook(filepath, read_only=True)
+                        has_s2 = _sheet_name in wb_c2.sheetnames
+                        wb_c2.close()
+                        if not has_s2:
+                            continue
+                    except Exception:
+                        continue
 
-                for sheet_name in sheets_to_read:
-                    ws = wb[sheet_name]
+                if progress_callback:
+                    progress_callback(total + idx, total * 2,
+                                      f"[{out_sheet_name}] 正在合并: {os.path.basename(filepath)}")
+
+                try:
+                    wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+                    mapping = column_mappings[idx] if idx < len(column_mappings) else {}
+
+                    ws = wb[_sheet_name] if _sheet_name and _sheet_name in wb.sheetnames else wb[wb.sheetnames[0]]
 
                     row_count = 0
                     for row in ws.iter_rows(values_only=True):
                         row_count += 1
+                        is_header_row = (row_count <= detected_header_rows)
 
                         if not first_file:
-                            # 后续文件：跳过表头行
-                            if row_count <= detected_header_rows:
+                            if is_header_row:
                                 continue
 
-                        # 按列映射对齐写入
                         aligned_row = [''] * total_cols
-                        
-                        # 第一个文件的表头行（合并单元格行）特殊处理
-                        if first_file and row_count < detected_header_rows:
-                            # 合并单元格的表头行，直接按位置写入，不映射
-                            cleaned_row = [cell if cell is not None else '' for cell in row]
-                            # 补齐到统一列数
-                            while len(cleaned_row) < total_cols:
-                                cleaned_row.append('')
-                            aligned_row = cleaned_row
+
+                        if is_header_row:
+                            if first_file and first_file_header_rows_data:
+                                if row_count - 1 < len(first_file_header_rows_data):
+                                    pre_read = list(first_file_header_rows_data[row_count - 1])
+                                    while len(pre_read) < total_cols:
+                                        pre_read.append('')
+                                    aligned_row = pre_read[:total_cols]
+                                else:
+                                    cleaned_row = [cell if cell is not None else '' for cell in row]
+                                    while len(cleaned_row) < total_cols:
+                                        cleaned_row.append('')
+                                    aligned_row = cleaned_row
+                            else:
+                                cleaned_row = [cell if cell is not None else '' for cell in row]
+                                while len(cleaned_row) < total_cols:
+                                    cleaned_row.append('')
+                                aligned_row = cleaned_row
                         else:
-                            # 数据行：使用列映射对齐
                             for src_idx, cell_val in enumerate(row):
                                 if src_idx in mapping:
                                     dst_idx = mapping[src_idx]
                                     if dst_idx < total_cols:
-                                        # 确保不包含 None 值，write_only 模式不支持 None
                                         aligned_row[dst_idx] = cell_val if cell_val is not None else ''
-                        
-                        # 最后一道保险：确保所有单元格都不是 None
+
                         aligned_row = [cell if cell is not None else '' for cell in aligned_row]
 
-                        # 跳过空行
                         if config.skip_empty_rows and not any(cell for cell in aligned_row):
                             skipped_empty += 1
                             continue
 
-                        # 数据去重
-                        if config.deduplicate:
+                        if config.deduplicate and not is_header_row:
                             row_tuple = tuple(aligned_row)
                             if row_tuple in seen_rows:
                                 stats['duplicate_rows'] += 1
@@ -1277,72 +1582,73 @@ def merge_excel_files_with_decrypt(
 
                         out_ws.append(aligned_row)
                         total_data_rows += 1
+                        sheet_data_rows += 1
 
                         if progress_callback and total_data_rows % 2000 == 0:
                             progress_callback(total + idx, total * 2,
-                                              f"合并中: {os.path.basename(filepath)} - "
+                                              f"[{out_sheet_name}] 合并中: {os.path.basename(filepath)} - "
                                               f"{total_data_rows} 行")
 
                     first_file = False
+                    wb.close()
 
-                wb.close()
+                except Exception as e:
+                    logger.error(f"[{out_sheet_name}] 处理文件出错 {os.path.basename(filepath)}: {str(e)}")
+                    if progress_callback:
+                        progress_callback(total + idx, total * 2,
+                                          f"[{out_sheet_name}] 处理文件出错 {os.path.basename(filepath)}: {str(e)}")
+                    continue
 
-            except Exception as e:
-                logger.error(f"处理文件出错 {os.path.basename(filepath)}: {str(e)}")
-                if progress_callback:
-                    progress_callback(total + idx, total * 2,
-                                      f"处理文件出错 {os.path.basename(filepath)}: {str(e)}")
-                continue
+            # 记录当前 sheet 的合并信息
+            if merged_ranges_info:
+                all_sheet_merged_ranges[out_sheet_name] = merged_ranges_info
+            if total_cols > total_cols_max:
+                total_cols_max = total_cols
+            logger.info(f"[{out_sheet_name}] 合并完成: {sheet_data_rows} 行, {total_cols} 列, "
+                        f"合并单元格 {len(merged_ranges_info)} 个")
 
-        # 第四步：保存并应用合并单元格
-        # 如果有合并单元格，需要用常规模式重新打开并应用
-        if merged_ranges_info:
+        # 第四步：保存并应用所有 sheet 的合并单元格
+        if all_sheet_merged_ranges:
             try:
-                # 先保存write_only的文件
                 output_wb.save(output_path)
-                
-                # 然后用常规模式打开，应用合并单元格
                 from openpyxl import load_workbook
                 wb = load_workbook(output_path)
-                ws = wb[config.output_sheet_name]
-                
-                # 应用合并单元格
-                for mc_range in merged_ranges_info:
-                    ws.merge_cells(mc_range)
-                
-                # 保存
+                for sn, mc_ranges in all_sheet_merged_ranges.items():
+                    if sn in wb.sheetnames:
+                        ws = wb[sn]
+                        for mc_range in mc_ranges:
+                            ws.merge_cells(mc_range)
+                        logger.info(f"[{sn}] 成功应用 {len(mc_ranges)} 个合并单元格")
                 wb.save(output_path)
                 wb.close()
-                
-                logger.info(f"成功应用 {len(merged_ranges_info)} 个合并单元格")
+                total_mc = sum(len(v) for v in all_sheet_merged_ranges.values())
+                logger.info(f"成功应用 {total_mc} 个合并单元格 (跨 {len(all_sheet_merged_ranges)} 个 sheet)")
             except Exception as e:
                 logger.error(f"应用合并单元格失败: {str(e)}")
                 if progress_callback:
                     progress_callback(total * 2, total * 2,
                                       f"应用合并单元格失败: {str(e)}")
         else:
-            # 没有合并单元格，直接保存
             output_wb.save(output_path)
 
         # 更新统计信息
         stats['total_rows'] = total_data_rows
-        stats['total_columns'] = total_cols
+        stats['total_columns'] = total_cols_max
         stats['header_rows'] = detected_header_rows
         stats['skipped_empty_rows'] = skipped_empty
-        
+
+        total_mc_all = sum(len(v) for v in all_sheet_merged_ranges.values()) if all_sheet_merged_ranges else 0
         logger.info(
             f"合并完成! 共 {total_data_rows} 行, "
-            f"{total_cols} 列, "
-            f"表头 {detected_header_rows} 行, "
-            f"合并单元格 {len(merged_ranges_info)} 个"
+            f"{len(sheet_names_to_process)} 个 sheet, "
+            f"合并单元格 {total_mc_all} 个"
         )
-        
+
         if progress_callback:
             progress_callback(total * 2, total * 2,
                               f"合并完成! 共 {total_data_rows} 行, "
-                              f"{total_cols} 列, "
-                              f"表头 {detected_header_rows} 行, "
-                              f"合并单元格 {len(merged_ranges_info)} 个")
+                              f"{len(sheet_names_to_process)} 个 sheet, "
+                              f"合并单元格 {total_mc_all} 个")
 
     finally:
         # 清理临时文件
@@ -1350,6 +1656,258 @@ def merge_excel_files_with_decrypt(
             try:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
+            except Exception:
+                pass
+    
+    return stats
+
+
+# ============================================================
+# Excel 拆分模块
+# ============================================================
+
+def _detect_header_row_count(ws):
+    """
+    自动检测工作表的表头行数。
+    通过分析合并单元格范围来推断：找到跨越行（垂直合并）的最大行号。
+    如果没有任何合并单元格，默认返回 1。
+    """
+    max_header_row = 0
+    for merged_range in ws.merged_cells.ranges:
+        # 垂直合并（跨多行）说明是表头区域
+        if merged_range.max_row > max_header_row:
+            max_header_row = merged_range.max_row
+    if max_header_row == 0:
+        # 没有合并单元格，检查第一列是否有连续数据作为表头标识
+        # 默认1行表头
+        return 1
+    return max_header_row
+
+
+def _copy_cell_style(src_cell, dst_cell):
+    """复制单元格样式"""
+    if src_cell.has_style:
+        dst_cell.font = src_cell.font.copy()
+        dst_cell.border = src_cell.border.copy()
+        dst_cell.fill = src_cell.fill.copy()
+        dst_cell.number_format = src_cell.number_format
+        dst_cell.protection = src_cell.protection.copy()
+        dst_cell.alignment = src_cell.alignment.copy()
+
+
+def split_excel_by_column(
+    input_path: str,
+    split_col: int,
+    output_dir: str,
+    header_rows: int = 0,
+    password: str = None,
+    progress_callback=None,
+) -> Dict[str, Any]:
+    """
+    按指定列的值拆分 Excel 文件，支持多 sheet 和复杂多行合并表头。
+    
+    Args:
+        input_path: 输入的 Excel 文件路径
+        split_col: 拆分列索引（1-based）
+        output_dir: 输出目录路径
+        header_rows: 表头行数（0=自动检测）
+        password: 文件密码（如果文件加密）
+        progress_callback: 进度回调 (current, total, message)
+        
+    Returns:
+        拆分统计信息字典
+    """
+    import copy as _copy
+    
+    stats = {
+        'input_file': os.path.basename(input_path),
+        'split_column': split_col,
+        'output_dir': output_dir,
+        'sheets_processed': 0,
+        'total_output_files': 0,
+        'total_data_rows': 0,
+        'output_files': [],
+    }
+    
+    # 如果文件加密，先解密到临时文件
+    temp_file = None
+    work_path = input_path
+    if password and is_encrypted_file(input_path):
+        temp_file = decrypt_to_tempfile(input_path, password)
+        work_path = temp_file
+    
+    try:
+        # 加载工作簿
+        wb = openpyxl.load_workbook(work_path, read_only=False, data_only=False)
+        
+        all_sheet_names = wb.sheetnames
+        total_tasks = sum(1 for sn in all_sheet_names) * 2  # 读取 + 写入
+        current_task = 0
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 收集所有 sheet 的拆分数据
+        # {sheet_name: {value: [row_indices], ...}}
+        sheet_split_data = {}
+        # {sheet_name: header_row_count}
+        sheet_header_rows = {}
+        # 全局的唯一值集合（用于确定输出文件）
+        all_split_values = set()
+        
+        for sheet_name in all_sheet_names:
+            ws = wb[sheet_name]
+            
+            # 检测表头行数
+            if header_rows > 0:
+                hr = header_rows
+            else:
+                hr = _detect_header_row_count(ws)
+            sheet_header_rows[sheet_name] = hr
+            
+            if progress_callback:
+                current_task += 1
+                progress_callback(current_task, total_tasks, 
+                                 f"读取 [{sheet_name}] 数据...")
+            
+            # 按拆分列的值分组数据行
+            value_to_rows = {}
+            for row_idx in range(hr + 1, ws.max_row + 1):
+                cell_value = ws.cell(row_idx, split_col).value
+                if cell_value is None:
+                    key = '__空值__'
+                else:
+                    key = str(cell_value).strip()
+                    if not key:
+                        key = '__空值__'
+                
+                if key not in value_to_rows:
+                    value_to_rows[key] = []
+                value_to_rows[key].append(row_idx)
+                all_split_values.add(key)
+            
+            sheet_split_data[sheet_name] = value_to_rows
+        
+        # 移除空值键（如果有）
+        has_empty = '__空值__' in all_split_values
+        
+        # 为每个唯一值创建一个输出文件
+        output_values = sorted(v for v in all_split_values if v != '__空值__')
+        if has_empty:
+            output_values.append('__空值__')
+        
+        if progress_callback:
+            progress_callback(current_task, total_tasks,
+                             f"共发现 {len(output_values)} 个拆分值，开始生成文件...")
+        
+        for val in output_values:
+            # 创建新工作簿
+            new_wb = openpyxl.Workbook()
+            # 删除默认 sheet
+            new_wb.remove(new_wb.active)
+            
+            total_rows_in_file = 0
+            
+            for sheet_name in all_sheet_names:
+                ws_src = wb[sheet_name]
+                hr = sheet_header_rows[sheet_name]
+                value_to_rows = sheet_split_data[sheet_name]
+                
+                # 获取该 sheet 中匹配当前值的行
+                matching_rows = value_to_rows.get(val, [])
+                
+                # 即使没有匹配行，也保留 sheet（含表头）
+                # 但如果该 sheet 完全没有这个值且不是唯一 sheet，可以跳过
+                # 这里选择始终保留所有 sheet
+                
+                new_ws = new_wb.create_sheet(title=sheet_name)
+                
+                # 1. 复制表头行（包括值和样式）
+                for row_idx in range(1, hr + 1):
+                    for col_idx in range(1, ws_src.max_column + 1):
+                        src_cell = ws_src.cell(row_idx, col_idx)
+                        dst_cell = new_ws.cell(row_idx, col_idx)
+                        dst_cell.value = src_cell.value
+                        _copy_cell_style(src_cell, dst_cell)
+                
+                # 2. 复制表头区域的合并单元格
+                for merged_range in ws_src.merged_cells.ranges:
+                    if merged_range.max_row <= hr:
+                        # 完全在表头区域内的合并
+                        new_ws.merge_cells(str(merged_range))
+                    elif merged_range.min_row <= hr:
+                        # 跨越表头和数据区域的合并（只复制表头部分）
+                        # 这种情况很少见，但需要处理
+                        pass  # 不复制跨越的合并
+                
+                # 3. 复制匹配的数据行
+                dst_row = hr + 1
+                for src_row_idx in matching_rows:
+                    for col_idx in range(1, ws_src.max_column + 1):
+                        src_cell = ws_src.cell(src_row_idx, col_idx)
+                        dst_cell = new_ws.cell(dst_row, col_idx)
+                        dst_cell.value = src_cell.value
+                        _copy_cell_style(src_cell, dst_cell)
+                    dst_row += 1
+                    total_rows_in_file += 1
+                
+                # 4. 复制列宽
+                for col_letter, col_dim in ws_src.column_dimensions.items():
+                    new_ws.column_dimensions[col_letter].width = col_dim.width
+                
+                # 5. 复制行高（表头行）
+                for row_idx in range(1, hr + 1):
+                    if row_idx in ws_src.row_dimensions:
+                        row_dim = ws_src.row_dimensions[row_idx]
+                        if row_dim.height:
+                            new_ws.row_dimensions[row_idx].height = row_dim.height
+            
+            # 生成输出文件名
+            display_val = val if val != '__空值__' else '空值'
+            # 清理文件名中的非法字符
+            safe_name = ''.join(c for c in display_val if c not in r'\/:*?"<>|')
+            base_name = os.path.splitext(os.path.basename(input_path))[0]
+            output_filename = f"{base_name}_{safe_name}.xlsx"
+            output_path = os.path.join(output_dir, output_filename)
+            
+            # 避免文件名过长
+            if len(output_filename) > 200:
+                output_filename = output_filename[:200] + '.xlsx'
+                output_path = os.path.join(output_dir, output_filename)
+            
+            new_wb.save(output_path)
+            
+            stats['output_files'].append({
+                'value': display_val,
+                'path': output_path,
+                'rows': total_rows_in_file,
+            })
+            stats['total_output_files'] += 1
+            stats['total_data_rows'] += total_rows_in_file
+            
+            if progress_callback:
+                current_task += 1
+                progress_callback(current_task, total_tasks,
+                                 f"已生成: {output_filename} ({total_rows_in_file} 行)")
+        
+        wb.close()
+        
+        stats['sheets_processed'] = len(all_sheet_names)
+        
+        if progress_callback:
+            progress_callback(total_tasks, total_tasks,
+                             f"拆分完成! 共生成 {stats['total_output_files']} 个文件")
+        
+        logger.info(
+            f"拆分完成: {stats['total_output_files']} 个文件, "
+            f"{stats['sheets_processed']} 个 sheet, "
+            f"{stats['total_data_rows']} 行数据"
+        )
+        
+    finally:
+        # 清理临时文件
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
             except Exception:
                 pass
     
@@ -1367,13 +1925,13 @@ class DropArea(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setMinimumHeight(50)
+        self.setFixedHeight(40)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setText("拖拽 Excel 文件到此处，或点击选择文件")
-        self.setFont(QFont(_get_system_font(), 10))
+        self.setFont(QFont(_get_system_font(), 9))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._normal = "border: 2px dashed #bbb; border-radius: 6px; background: #fafafa; color: #999;"
-        self._hover = "border: 2px dashed #4CAF50; border-radius: 6px; background: #e8f5e9; color: #2E7D32;"
+        self._normal = "border: 1px dashed #ccc; border-radius: 4px; background: #fafafa; color: #aaa;"
+        self._hover = "border: 1px dashed #4CAF50; border-radius: 4px; background: #e8f5e9; color: #2E7D32;"
         self.setStyleSheet(self._normal)
 
     def mousePressEvent(self, event):
@@ -1444,6 +2002,43 @@ class MergeWorker(QThread):
         self.progress.emit(current, total, message)
 
 
+class SplitWorker(QThread):
+    """拆分工作线程"""
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, input_path, split_col, output_dir, header_rows=0, password=None):
+        super().__init__()
+        self.input_path = input_path
+        self.split_col = split_col
+        self.output_dir = output_dir
+        self.header_rows = header_rows
+        self.password = password
+
+    def run(self):
+        try:
+            stats = split_excel_by_column(
+                self.input_path,
+                self.split_col,
+                self.output_dir,
+                header_rows=self.header_rows,
+                password=self.password,
+                progress_callback=self._progress,
+            )
+            msg = f"拆分完成!\n"
+            msg += f"生成文件: {stats['total_output_files']} 个\n"
+            msg += f"处理 sheet: {stats['sheets_processed']} 个\n"
+            msg += f"总数据行: {stats['total_data_rows']}\n"
+            for f in stats['output_files']:
+                msg += f"  {f['value']}: {f['rows']} 行 -> {os.path.basename(f['path'])}\n"
+            self.finished.emit(True, msg)
+        except Exception as e:
+            self.finished.emit(False, f"拆分失败: {str(e)}")
+
+    def _progress(self, current, total, message):
+        self.progress.emit(current, total, message)
+
+
 class MainWindow(QMainWindow):
     """主窗口 - 简洁版"""
 
@@ -1467,14 +2062,15 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("加密Excel合并工具 v2.0")
-        self.setMinimumSize(600, 420)
-        self.resize(700, 500)
+        self.setWindowTitle("加密Excel合并/拆分工具 v2.0")
+        self.setMinimumSize(600, 560)
+        self.resize(720, 640)
 
         # 数据存储
         self.file_list = []  # [(filepath, city, password, sheet_name), ...]
         self.city_passwords = OrderedDict()  # {city: password}
         self.worker = None
+        self.split_worker = None
         self.recent_files = []  # 最近使用的文件列表
         
         # 加载配置
@@ -1487,8 +2083,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setSpacing(4)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(5)
+        layout.setContentsMargins(10, 8, 10, 8)
 
         # === 拖拽区域 ===
         self.drop_area = DropArea()
@@ -1515,9 +2111,10 @@ class MainWindow(QMainWindow):
         pwd_row.addWidget(add_pwd_btn)
         self.pwd_input.returnPressed.connect(self._add_password_inline)
         
-        # 批量导入按钮
-        import_btn = QPushButton("批量导入")
+        # 导入密码按钮
+        import_btn = QPushButton("导入密码")
         import_btn.setFixedWidth(70)
+        import_btn.setToolTip("从 Excel 文件导入城市密码（A列=城市, B列=密码, 第1行为表头）")
         import_btn.clicked.connect(self._import_passwords_batch)
         pwd_row.addWidget(import_btn)
         
@@ -1535,7 +2132,7 @@ class MainWindow(QMainWindow):
         self.pwd_tags_layout.setSpacing(4)
         self.pwd_tags_widget = QWidget()
         self.pwd_tags_widget.setLayout(self.pwd_tags_layout)
-        self.pwd_tags_widget.setFixedHeight(28)
+        self.pwd_tags_widget.setFixedHeight(48)
         layout.addWidget(self.pwd_tags_widget)
 
         # === 文件列表 ===
@@ -1554,11 +2151,13 @@ class MainWindow(QMainWindow):
         self.file_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
         self.file_table.setItemDelegateForColumn(1, CityComboDelegate(self.file_table, self))
         self.file_table.itemChanged.connect(self._on_file_table_item_changed)
+        self.file_table.setMaximumHeight(170)
         layout.addWidget(self.file_table, 1)
 
         # 文件操作行
         file_btn_row = QHBoxLayout()
         file_btn_row.setSpacing(4)
+        file_btn_row.setContentsMargins(0, 0, 0, 0)
         remove_btn = QPushButton("移除选中")
         remove_btn.clicked.connect(self._remove_selected_file)
         file_btn_row.addWidget(remove_btn)
@@ -1614,6 +2213,89 @@ class MainWindow(QMainWindow):
         self.merge_btn.clicked.connect(self._start_merge)
         layout.addWidget(self.merge_btn)
 
+        # 分隔线
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("color: #e0e0e0;")
+        layout.addWidget(sep)
+
+        # === 拆分功能区域 ===
+        split_group = QGroupBox("文件拆分")
+        split_group.setToolTip("按拆分列的唯一值将文件拆分为多个Excel，保留所有sheet和表头合并格式")
+        split_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #e0e0e0; border-radius: 4px; margin-top: 4px; padding-top: 2px; } QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }")
+        split_layout = QVBoxLayout(split_group)
+        split_layout.setSpacing(4)
+        split_layout.setContentsMargins(8, 10, 8, 6)
+
+        # 拆分文件选择
+        split_file_row = QHBoxLayout()
+        split_file_row.addWidget(QLabel("文件:"))
+        self.split_file_edit = QLineEdit()
+        self.split_file_edit.setPlaceholderText("选择要拆分的 Excel 文件(支持加密文件)...")
+        self.split_file_edit.setReadOnly(True)
+        split_file_row.addWidget(self.split_file_edit, 1)
+        split_file_browse_btn = QPushButton("浏览")
+        split_file_browse_btn.setFixedWidth(50)
+        split_file_browse_btn.clicked.connect(self._select_split_file)
+        split_file_row.addWidget(split_file_browse_btn)
+        split_layout.addLayout(split_file_row)
+
+        # 拆分配置行
+        split_config_row = QHBoxLayout()
+        split_config_row.setSpacing(8)
+        split_col_label = QLabel("拆分列:")
+        split_col_label.setToolTip("指定按第几列的值进行拆分，1表示第A列，2表示第B列，以此类推")
+        split_config_row.addWidget(split_col_label)
+        self.split_col_spin = QSpinBox()
+        self.split_col_spin.setMinimum(1)
+        self.split_col_spin.setMaximum(999)
+        self.split_col_spin.setValue(3)
+        self.split_col_spin.setFixedWidth(60)
+        self.split_col_spin.setToolTip("按第几列的值拆分（1=A列, 2=B列, 3=C列...）")
+        split_config_row.addWidget(self.split_col_spin)
+        split_config_row.addWidget(QLabel("密码:"))
+        self.split_pwd_input = QLineEdit()
+        self.split_pwd_input.setPlaceholderText("文件密码(可选)")
+        self.split_pwd_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.split_pwd_input.setFixedWidth(60)
+        self.split_pwd_input.setToolTip("如果文件有加密密码，请在此输入；无密码则留空")
+        split_config_row.addWidget(self.split_pwd_input)
+        split_header_label = QLabel("表头行:")
+        split_header_label.setToolTip("表头占几行（含合并单元格标题行），0表示自动检测")
+        split_config_row.addWidget(split_header_label)
+        self.split_header_spin = QSpinBox()
+        self.split_header_spin.setMinimum(0)
+        self.split_header_spin.setMaximum(60)
+        self.split_header_spin.setValue(0)
+        self.split_header_spin.setFixedWidth(50)
+        self.split_header_spin.setToolTip("表头行数：0=自动检测，1=单行表头，2=双行表头，以此类推")
+        split_config_row.addWidget(self.split_header_spin)
+        split_config_row.addStretch()
+        split_layout.addLayout(split_config_row)
+
+        # 输出目录 + 拆分按钮
+        split_output_row = QHBoxLayout()
+        split_output_row.addWidget(QLabel("输出:"))
+        self.split_output_edit = QLineEdit()
+        self.split_output_edit.setPlaceholderText("拆分后输出目录...")
+        self.split_output_edit.setToolTip("拆分后的文件将保存到该目录")
+        split_output_row.addWidget(self.split_output_edit, 1)
+        split_output_browse_btn = QPushButton("...")
+        split_output_browse_btn.setFixedWidth(30)
+        split_output_browse_btn.clicked.connect(self._select_split_output)
+        split_output_row.addWidget(split_output_browse_btn)
+        self.split_btn = QPushButton("开始拆分")
+        self.split_btn.setMinimumHeight(28)
+        self.split_btn.setMinimumWidth(80)
+        self.split_btn.setToolTip("按拆分列的值将文件拆分为多个Excel文件")
+        self.split_btn.clicked.connect(self._start_split)
+        split_output_row.addWidget(self.split_btn)
+        split_layout.addLayout(split_output_row)
+
+        layout.addWidget(split_group)
+
         self.statusBar().showMessage("就绪")
 
     def _apply_styles(self):
@@ -1636,9 +2318,14 @@ class MainWindow(QMainWindow):
                 background: #f5f5f5; border: none;
                 border-bottom: 1px solid #ddd; padding: 3px; font-weight: bold;
             }
+            QGroupBox { font-weight: bold; }
+            QLineEdit { border: 1px solid #ddd; border-radius: 3px; padding: 2px 6px; font-size: 11px; }
+            QLineEdit:focus { border-color: #2196F3; }
+            QSpinBox { border: 1px solid #ddd; border-radius: 3px; padding: 1px 4px; font-size: 11px; }
+            QLabel { font-size: 11px; }
             QProgressBar {
-                border: 1px solid #ddd; border-radius: 3px;
-                text-align: center; height: 14px;
+                border: 1px solid #e0e0e0; border-radius: 3px;
+                text-align: center; font-size: 10px;
             }
             QProgressBar::chunk { background: #4CAF50; border-radius: 2px; }
         """)
@@ -1920,18 +2607,97 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("合并失败")
             QMessageBox.critical(self, "失败", message)
 
+    # === 拆分功能事件处理 ===
+
+    def _select_split_file(self):
+        """选择要拆分的文件"""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "选择要拆分的 Excel 文件", "",
+            "Excel 文件 (*.xlsx *.xls);;所有文件 (*)"
+        )
+        if filepath:
+            self.split_file_edit.setText(filepath)
+
+    def _select_split_output(self):
+        """选择拆分输出目录"""
+        dirpath = QFileDialog.getExistingDirectory(self, "选择拆分输出目录")
+        if dirpath:
+            self.split_output_edit.setText(dirpath)
+
+    def _start_split(self):
+        """启动拆分"""
+        input_path = self.split_file_edit.text().strip()
+        if not input_path:
+            QMessageBox.warning(self, "提示", "请先选择要拆分的文件")
+            return
+        if not os.path.exists(input_path):
+            QMessageBox.warning(self, "提示", "文件不存在")
+            return
+
+        output_dir = self.split_output_edit.text().strip()
+        if not output_dir:
+            QMessageBox.warning(self, "提示", "请选择输出目录")
+            return
+
+        split_col = self.split_col_spin.value()
+        header_rows = self.split_header_spin.value()
+        password = self.split_pwd_input.text().strip() or None
+
+        self.split_btn.setEnabled(False)
+        self.split_btn.setText("拆分中...")
+        self.progress_bar.setValue(0)
+        self.statusBar().showMessage("正在拆分...")
+
+        self.split_worker = SplitWorker(
+            input_path, split_col, output_dir,
+            header_rows=header_rows, password=password
+        )
+        self.split_worker.progress.connect(self._on_split_progress)
+        self.split_worker.finished.connect(self._on_split_finished)
+        self.split_worker.start()
+
+    def _on_split_progress(self, current, total, message):
+        """拆分进度更新"""
+        if total > 0:
+            self.progress_bar.setValue(int(current / total * 100))
+        self.statusBar().showMessage(message)
+
+    def _on_split_finished(self, success, message):
+        """拆分完成"""
+        self.split_btn.setEnabled(True)
+        self.split_btn.setText("开始拆分")
+
+        if success:
+            self.progress_bar.setValue(100)
+            self.statusBar().showMessage("拆分完成!")
+            QMessageBox.information(self, "完成", message)
+        else:
+            self.statusBar().showMessage("拆分失败")
+            QMessageBox.critical(self, "失败", message)
+
     def closeEvent(self, event):
         """关闭窗口"""
+        running_workers = []
         if self.worker and self.worker.isRunning():
+            running_workers.append("合并")
+        if self.split_worker and self.split_worker.isRunning():
+            running_workers.append("拆分")
+
+        if running_workers:
             reply = QMessageBox.question(
-                self, "确认退出", "正在合并中，确定退出?",
+                self, "确认退出",
+                f"正在{'、'.join(running_workers)}中，确定退出?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
-            self.worker.terminate()
-            self.worker.wait()
+            if self.worker and self.worker.isRunning():
+                self.worker.terminate()
+                self.worker.wait()
+            if self.split_worker and self.split_worker.isRunning():
+                self.split_worker.terminate()
+                self.split_worker.wait()
         
         # 保存配置
         self._save_config()
@@ -2017,20 +2783,45 @@ class MainWindow(QMainWindow):
                                 imported_count += 1
             
             elif filepath.endswith(('.xlsx', '.xls')):
-                # Excel 格式: 第一列城市名称，第二列密码
-                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-                ws = wb.active
-                
-                # 跳过表头（如果有的话），从第二行开始读取
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    if len(row) >= 2:
-                        city = str(row[0]).strip() if row[0] is not None else ''
-                        password = str(row[1]).strip() if row[1] is not None else ''
-                        if city:
-                            self.city_passwords[city] = password
-                            imported_count += 1
-                
-                wb.close()
+                # Excel 格式: 第一列城市名称，第二列密码，支持加密文件
+                read_path = filepath
+                temp_path = None
+                try:
+                    if is_encrypted_file(filepath):
+                        # 尝试用常见密码解密
+                        for pwd in ['', '1', '123', '123456', 'password']:
+                            try:
+                                temp_path = decrypt_to_tempfile(filepath, pwd)
+                                break
+                            except Exception:
+                                continue
+                        if temp_path is None:
+                            # 常见密码都不行，弹出输入框
+                            pwd, ok = QInputDialog.getText(self, "文件加密", "请输入密码文件的解密密码:", QLineEdit.EchoMode.Password)
+                            if not ok or not pwd:
+                                return
+                            temp_path = decrypt_to_tempfile(filepath, pwd)
+                        read_path = temp_path
+                    
+                    wb = openpyxl.load_workbook(read_path, read_only=True, data_only=True)
+                    ws = wb.active
+                    
+                    # 跳过表头（如果有的话），从第二行开始读取
+                    for row in ws.iter_rows(min_row=2, values_only=True):
+                        if len(row) >= 2:
+                            city = str(row[0]).strip() if row[0] is not None else ''
+                            password = str(row[1]).strip() if row[1] is not None else ''
+                            if city:
+                                self.city_passwords[city] = password
+                                imported_count += 1
+                    
+                    wb.close()
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.unlink(temp_path)
+                        except Exception:
+                            pass
             
             self._refresh_pwd_tags()
             self._auto_match_all_files()
